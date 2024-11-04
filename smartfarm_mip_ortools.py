@@ -34,7 +34,6 @@ DC = data["transport_cost"]  # 운송 비용
 DF = {tuple(map(int, key.strip("()").split(","))): value for key, value in data["farm_store_distance"].items()}
 DS = {tuple(map(int, key.strip("()").split(","))): value for key, value in data["store_store_distance"].items()}
 
-
 # 모델 초기화
 solver = pywraplp.Solver.CreateSolver('SCIP')
 
@@ -54,18 +53,39 @@ ceil_w = {(s, i): solver.IntVar(0, solver.infinity(), f'ceil_w_{s}_{i}') for i i
 # 목적 함수 정의
 objective_terms = []
 for k in crops:
-    objective_terms.append(B[k] * (
+    # Objective term for total sales
+    total_sales = B[k] * (
         solver.Sum(x[i, k] for i in stores) +
         solver.Sum(w[s, i, k] for s in stores for i in stores if s != i) +
-        solver.Sum(z[j, i, k] for j in farms for i in stores))
+        solver.Sum(z[j, i, k] for j in farms for i in stores)
     )
-    
-    objective_terms.append(-CS[k] * solver.Sum(x[i, k] + solver.Sum(w[s, i, k] for s in stores if i != s) for i in stores))
-    objective_terms.append(-CF[k] * solver.Sum(z[j, i, k] for j in farms for i in stores))
-    objective_terms.append(-solver.Sum(ceil_w[s, i] * DC * DS[s, i] for i in stores for s in stores if s != i))
-    objective_terms.append(-solver.Sum(ceil_z[j, i] * DC * DF[j, i] for j in farms for i in stores))
-    objective_terms.append(-PC[k] * solver.Sum(l[i, k] for i in stores))
+    objective_terms.append(total_sales)
 
+    # Store costs
+    store_costs = -CS[k] * solver.Sum(x[i, k] for i in stores)
+    objective_terms.append(store_costs)
+
+    # Store costs from other stores
+    store_costs_from_others = -CS[k] * solver.Sum(w[s, i, k] for s in stores for i in stores if i != s)
+    objective_terms.append(store_costs_from_others)
+
+    # Farm costs
+    farm_costs = -CF[k] * solver.Sum(z[j, i, k] for j in farms for i in stores)
+    objective_terms.append(farm_costs)
+
+# 전체 운송 비용 계산 (작물별로 합치지 않음)
+transport_costs_stores = -solver.Sum(ceil_w[s, i] * DC * DS[s, i] for i in stores for s in stores if s != i)
+objective_terms.append(transport_costs_stores)
+
+transport_costs_farms = -solver.Sum(ceil_z[j, i] * DC * DF[j, i] for j in farms for i in stores)
+objective_terms.append(transport_costs_farms)
+
+# Penalty costs
+for k in crops:
+    penalty_costs = -PC[k] * solver.Sum(l[i, k] for i in stores)
+    objective_terms.append(penalty_costs)
+
+# Objective function maximization
 solver.Maximize(solver.Sum(objective_terms))
 
 # 수요 만족 제약식
@@ -91,7 +111,7 @@ for i in stores:
     for s in stores:
         if i != s:
             for k in crops:
-                total_w = solver.Sum(w[s, i, k] for k in crops)  # 수정된 부분
+                total_w = solver.Sum(w[s, i, k] for k in crops)
                 # 올림 조건을 제약식으로 구현
                 solver.Add(ceil_w[s, i] >= total_w / Q)
                 solver.Add(ceil_w[s, i] <= (total_w + Q - 1) / Q)
@@ -100,10 +120,42 @@ for i in stores:
 for j in farms:
     for i in stores:
         for k in crops:
-            total_z = solver.Sum(z[j, i, k] for k in crops)  # 수정된 부분
+            total_z = solver.Sum(z[j, i, k] for k in crops)
             # 올림 조건을 제약식으로 구현
             solver.Add(ceil_z[j, i] >= total_z / Q)
             solver.Add(ceil_z[j, i] <= (total_z + Q - 1) / Q)
+
+# 해결
+status = solver.Solve()
+
+# 해결 결과 출력
+if status == pywraplp.Solver.OPTIMAL:
+    print(f"목적함수: {round(solver.Objective().Value())}")
+
+    # 목적 함수 구성 요소 출력
+    print("\n===== 목적 함수 구성 요소 =====")
+    for k in crops:
+        # 계산된 값
+        sales = B[k] * (
+            sum(x[i, k].solution_value() for i in stores) +
+            sum(w[s, i, k].solution_value() for s in stores for i in stores if s != i) +
+            sum(z[j, i, k].solution_value() for j in farms for i in stores)
+        )
+        store_cost = -CS[k] * sum(x[i, k].solution_value() for i in stores)
+        store_cost_other = -CS[k] * sum(w[s, i, k].solution_value() for s in stores for i in stores if i != s)
+        farm_cost = -CF[k] * sum(z[j, i, k].solution_value() for j in farms for i in stores)
+        transport_cost_stores = -sum(ceil_w[s, i].solution_value() * DC * DS[s, i] for i in stores for s in stores if s != i)
+        transport_cost_farms = -sum(ceil_z[j, i].solution_value() * DC * DF[j, i] for j in farms for i in stores)
+        penalty_cost = -PC[k] * sum(l[i, k].solution_value() for i in stores)
+
+        total_objective = sales + store_cost + store_cost_other + farm_cost + transport_cost_stores + transport_cost_farms + penalty_cost
+
+        print(f"작물 {k}: 판매수익 = {sales}, 스토어 비용 = {store_cost}, 다른 스토어 비용 = {store_cost_other}, 농장 비용 = {farm_cost}, "
+              f"스토어 운송 비용 = {transport_cost_stores}, 농장 운송 비용 = {transport_cost_farms}, 패널티 비용 = {penalty_cost}, "
+              f"총합 = {total_objective}")
+
+else:
+    print(f"해를 찾지 못했습니다.")
 
 # 해결
 status = solver.Solve()
@@ -215,11 +267,9 @@ if status == pywraplp.Solver.OPTIMAL:
     df = pd.DataFrame(results)
 
     # CSV 파일로 저장
-    output_path = r"C:\smartfarm\output\results.csv"
+    output_path = r"C:\smartfarm\output\results_1.csv"
     df.to_csv(output_path, index=False)
 
     print(f"결과가 {output_path}에 저장되었습니다.")
 else:
     print(f"해를 찾지 못했습니다.")
-
-
